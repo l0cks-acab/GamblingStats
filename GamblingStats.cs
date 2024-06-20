@@ -1,12 +1,13 @@
 using Oxide.Core;
 using Oxide.Core.Libraries.Covalence;
-using Oxide.Core.Database;
 using System.Collections.Generic;
 using System.Linq;
+using System;
+using System.IO;
 
 namespace Oxide.Plugins
 {
-    [Info("GamblingStats", "herbs.acab", "1.1.0")]
+    [Info("GamblingStats", "herbs.acab", "1.3.0")]
     [Description("Records and displays gambling statistics for players.")]
 
     class GamblingStats : CovalencePlugin
@@ -19,30 +20,26 @@ namespace Oxide.Plugins
         }
 
         private Dictionary<string, PlayerStats> playerStats = new Dictionary<string, PlayerStats>();
-
-        private bool useMySql;
-        private MySql sql;
-        private Connection connection;
+        private const int BackupCount = 5;
+        private const float SaveInterval = 600f; // Save every 10 minutes
 
         protected override void LoadDefaultConfig()
         {
-            Config["StorageMethod"] = "internal"; // options: internal, mysql
-            Config["MySqlHost"] = "localhost";
-            Config["MySqlPort"] = 3306;
-            Config["MySqlUser"] = "root";
-            Config["MySqlPass"] = "password";
-            Config["MySqlDb"] = "rust_gambling_stats";
-            SaveConfig();
+            // No configuration needed for local storage
         }
 
         void Init()
         {
-            useMySql = Config["StorageMethod"].ToString().ToLower() == "mysql";
-            if (useMySql)
-            {
-                InitMySql();
-            }
             LoadData();
+            timer.Every(SaveInterval, SaveData);
+            Puts("GamblingStats plugin loaded.");
+            permission.RegisterPermission("gamblingstats.admin", this);
+        }
+
+        void Unload()
+        {
+            SaveData();
+            Puts("GamblingStats plugin unloaded.");
         }
 
         void OnServerSave()
@@ -55,7 +52,22 @@ namespace Oxide.Plugins
             SaveData();
         }
 
+        void OnPlayerInit(BasePlayer player)
+        {
+            var stats = GetPlayerStats(player.UserIDString);
+            int profitLoss = stats.ScrapEarned - (stats.ScrapSpent - stats.ScrapLost);
+            player.ChatMessage($"Welcome! Your current gambling profit/loss is: {profitLoss} scrap.");
+        }
+
         // Commands
+        [Command("help")]
+        void HelpCommand(IPlayer player, string command, string[] args)
+        {
+            player.Message("<color=red>/mystats</color> - View your gambling statistics.");
+            player.Message("<color=red>/topstats</color> - View the top 10 gamblers.");
+            player.Message("<color=red>/searchstats <PlayerName or Steam64ID></color> - View gambling statistics for a specific player.");
+        }
+
         [Command("mystats")]
         void MyStatsCommand(IPlayer player, string command, string[] args)
         {
@@ -97,6 +109,28 @@ namespace Oxide.Plugins
             player.Message($"{targetPlayer.Name} has spent {stats.ScrapSpent} scrap, lost {stats.ScrapLost} scrap, and earned {stats.ScrapEarned} scrap through gambling.");
         }
 
+        [Command("deldata"), Permission("gamblingstats.admin")]
+        void DelDataCommand(IPlayer player, string command, string[] args)
+        {
+            if (args.Length == 0)
+            {
+                player.Message("Usage: /deldata <Steam64ID>");
+                return;
+            }
+
+            string playerId = args[0];
+            if (playerStats.Remove(playerId))
+            {
+                player.Message($"Player data for {playerId} has been removed.");
+            }
+            else
+            {
+                player.Message($"Player data for {playerId} not found.");
+            }
+
+            SaveData();
+        }
+
         // Hook into specific gambling events
         void OnScrapSpent(BasePlayer player, int amount)
         {
@@ -122,25 +156,33 @@ namespace Oxide.Plugins
         // Helper methods to load, save, and get player stats
         void LoadData()
         {
-            if (useMySql)
-            {
-                LoadDataFromMySql();
-            }
-            else
-            {
-                playerStats = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, PlayerStats>>(Name);
-            }
+            playerStats = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, PlayerStats>>(Name);
         }
 
         void SaveData()
         {
-            if (useMySql)
+            CreateBackup();
+            Interface.Oxide.DataFileSystem.WriteObject(Name, playerStats);
+        }
+
+        void CreateBackup()
+        {
+            string backupDir = $"{Interface.Oxide.DataDirectory}/{Name}/backups";
+            string backupFile = $"{backupDir}/{Name}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.json";
+
+            if (!Directory.Exists(backupDir))
+                Directory.CreateDirectory(backupDir);
+
+            File.Copy($"{Interface.Oxide.DataDirectory}/{Name}.json", backupFile, true);
+
+            var backupFiles = new DirectoryInfo(backupDir).GetFiles().OrderByDescending(f => f.CreationTime).ToList();
+
+            if (backupFiles.Count > BackupCount)
             {
-                SaveDataToMySql();
-            }
-            else
-            {
-                Interface.Oxide.DataFileSystem.WriteObject(Name, playerStats);
+                for (int i = BackupCount; i < backupFiles.Count; i++)
+                {
+                    backupFiles[i].Delete();
+                }
             }
         }
 
@@ -162,55 +204,6 @@ namespace Oxide.Plugins
         IPlayer FindPlayer(string identifier)
         {
             return covalence.Players.FindPlayer(identifier);
-        }
-
-        // MySQL Integration
-        void InitMySql()
-        {
-            sql = Interface.Oxide.GetLibrary<MySql>();
-            var host = Config["MySqlHost"].ToString();
-            var port = int.Parse(Config["MySqlPort"].ToString());
-            var user = Config["MySqlUser"].ToString();
-            var pass = Config["MySqlPass"].ToString();
-            var db = Config["MySqlDb"].ToString();
-
-            connection = sql.OpenDb($"{host}:{port}", user, pass, db, this);
-
-            sql.Query(@"
-                CREATE TABLE IF NOT EXISTS GamblingStats (
-                    PlayerId VARCHAR(17) PRIMARY KEY,
-                    ScrapSpent INT DEFAULT 0,
-                    ScrapLost INT DEFAULT 0,
-                    ScrapEarned INT DEFAULT 0
-                )", connection);
-        }
-
-        void LoadDataFromMySql()
-        {
-            sql.Query("SELECT * FROM GamblingStats", connection, list =>
-            {
-                foreach (var entry in list)
-                {
-                    var playerId = entry["PlayerId"].ToString();
-                    var stats = new PlayerStats
-                    {
-                        ScrapSpent = int.Parse(entry["ScrapSpent"].ToString()),
-                        ScrapLost = int.Parse(entry["ScrapLost"].ToString()),
-                        ScrapEarned = int.Parse(entry["ScrapEarned"].ToString())
-                    };
-                    playerStats[playerId] = stats;
-                }
-            });
-        }
-
-        void SaveDataToMySql()
-        {
-            foreach (var entry in playerStats)
-            {
-                sql.Insert(@$"
-                    REPLACE INTO GamblingStats (PlayerId, ScrapSpent, ScrapLost, ScrapEarned) 
-                    VALUES ('{entry.Key}', {entry.Value.ScrapSpent}, {entry.Value.ScrapLost}, {entry.Value.ScrapEarned})", connection);
-            }
         }
     }
 }
